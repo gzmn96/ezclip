@@ -1,6 +1,6 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import crypto from 'node:crypto';
+import { createHmac } from 'node:crypto';
 import { parseStringPromise } from 'xml2js';
 import { QUEUES, createLogger, createQueue, loadConfig, IngestJob } from '@ezclip/common';
 
@@ -37,7 +37,7 @@ app.post('/webhook/youtube', async (req, res) => {
     return;
   }
 
-  const hmac = crypto.createHmac('sha1', config.ytHubSecret);
+  const hmac = createHmac('sha1', config.ytHubSecret);
   hmac.update(req.body ?? '');
   const expected = `sha1=${hmac.digest('hex')}`;
   if (signature !== expected) {
