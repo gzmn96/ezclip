@@ -43,7 +43,7 @@ export const processClipJob = async (job: ClipJob) => {
 };
 
 const main = () => {
-  createWorker<ClipJob>(QUEUES.clip, async (bullJob) => {
+  createWorker<ClipJob>(QUEUES.clip, async (bullJob: any) => {
     await processClipJob(bullJob.data);
   });
   logger.info('clipper worker ready');

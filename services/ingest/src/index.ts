@@ -77,7 +77,7 @@ export const processIngestJob = async (job: IngestJob) => {
 };
 
 const main = () => {
-  createWorker<IngestJob>(QUEUES.ingest, async (bullJob) => {
+  createWorker<IngestJob>(QUEUES.ingest, async (bullJob: any) => {
     await processIngestJob(bullJob.data);
   });
 

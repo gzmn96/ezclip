@@ -7,7 +7,7 @@ export const processPublishJob = async (job: PublishJob) => {
 };
 
 const main = () => {
-  createWorker<PublishJob>(QUEUES.publish, async (bullJob) => {
+  createWorker<PublishJob>(QUEUES.publish, async (bullJob: any) => {
     await processPublishJob(bullJob.data);
   });
 

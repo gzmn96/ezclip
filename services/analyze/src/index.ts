@@ -45,7 +45,7 @@ export const processAnalyzeJob = async (job: AnalyzeJob) => {
 };
 
 const main = () => {
-  createWorker<AnalyzeJob>(QUEUES.analyze, async (bullJob) => {
+  createWorker<AnalyzeJob>(QUEUES.analyze, async (bullJob: any) => {
     await processAnalyzeJob(bullJob.data);
   });
   logger.info('analyze worker ready');
