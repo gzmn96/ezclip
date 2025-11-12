@@ -1,18 +1,12 @@
 variable "project_id" {
-  description = "GCP Project ID"
+  description = "GCP project ID for the target environment"
   type        = string
 }
 
 variable "region" {
-  description = "GCP region"
+  description = "Primary GCP region"
   type        = string
   default     = "us-central1"
-}
-
-variable "repository" {
-  description = "Artifact Registry repository name"
-  type        = string
-  default     = "ezclip"
 }
 
 provider "google" {
@@ -24,4 +18,3 @@ provider "google-beta" {
   project = var.project_id
   region  = var.region
 }
-

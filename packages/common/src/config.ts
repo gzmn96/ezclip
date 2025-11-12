@@ -8,6 +8,7 @@ export interface AppConfig {
   ytHubSecret: string | undefined;
   tmpDir: string;
   sampleVideoPath: string | undefined;
+  gcsBucket: string | undefined;
 }
 
 export const loadConfig = (): AppConfig => {
@@ -17,5 +18,6 @@ export const loadConfig = (): AppConfig => {
     ytHubSecret: process.env.YT_HUB_SECRET,
     tmpDir: process.env.TMP_DIR ?? '/app/tmp',
     sampleVideoPath: process.env.SAMPLE_VIDEO_PATH,
+    gcsBucket: process.env.GCS_BUCKET,
   };
 };
