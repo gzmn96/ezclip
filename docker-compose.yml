@@ -1,0 +1,68 @@
+version: '3.9'
+services:
+  postgres:
+    image: postgres:16-alpine
+    command: postgres -c shared_buffers=256MB -c max_connections=50
+    environment:
+      POSTGRES_DB: ezclip
+      POSTGRES_USER: ezclip
+      POSTGRES_PASSWORD: ezclip
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ 'CMD-SHELL', 'pg_isready -U ezclip' ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: [ 'CMD', 'redis-cli', 'ping' ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  webhook:
+    build:
+      context: .
+      dockerfile: services/webhook/Dockerfile
+    environment:
+      ENVIRONMENT: test
+      PROJECT_ID: local
+      REDIS_URL: redis://redis:6379
+      YT_HUB_SECRET: ${YT_HUB_SECRET:-change_me}
+      TMP_DIR: /app/tmp
+      GCS_BUCKET: local-bucket
+    ports:
+      - '3001:3000'
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./tmp:/app/tmp
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      ENVIRONMENT: test
+      PROJECT_ID: local
+      REDIS_URL: redis://redis:6379
+      TMP_DIR: /app/tmp
+      SAMPLE_VIDEO_PATH: /app/sample.mp4
+      GCS_BUCKET: local-bucket
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./tmp:/app/tmp
+      - ./tests/assets/sample.mp4:/app/sample.mp4:ro
+
+volumes:
+  pgdata:

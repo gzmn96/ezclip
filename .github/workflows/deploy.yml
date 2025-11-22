@@ -1,0 +1,131 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: us-central1
+  ARTIFACT_REPO: ezclip-repo
+  SERVICES: webhook ingest analyze clipper publish
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: context
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            ENVIRONMENT=prod
+            PROJECT_ID="${{ secrets.GCP_PROJECT_ID_PROD }}"
+            REDIS_TIER=STANDARD_HA
+            REDIS_SIZE=2
+          else
+            ENVIRONMENT=test
+            PROJECT_ID="${{ secrets.GCP_PROJECT_ID_TEST }}"
+            REDIS_TIER=BASIC
+            REDIS_SIZE=1
+          fi
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          SERVICE_ACCOUNT="github-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
+          {
+            echo "environment=${ENVIRONMENT}"
+            echo "project_id=${PROJECT_ID}"
+            echo "redis_tier=${REDIS_TIER}"
+            echo "redis_size=${REDIS_SIZE}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "service_account=${SERVICE_ACCOUNT}"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: 'access_token'
+          workload_identity_provider: "projects/247760083414/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          service_account: "${{ steps.context.outputs.service_account }}"
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ steps.context.outputs.project_id }}
+
+      - name: Configure Artifact Registry auth
+        run: |
+          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Build and push service images
+        id: build
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          ENVIRONMENT: ${{ steps.context.outputs.environment }}
+          SHORT_SHA: ${{ steps.context.outputs.short_sha }}
+          REGION: ${{ env.REGION }}
+          ARTIFACT_REPO: ${{ env.ARTIFACT_REPO }}
+        run: |
+          set -euo pipefail
+          REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}"
+          services=(${SERVICES})
+          : > image-digests.txt
+          for svc in "${services[@]}"; do
+            image="${REGISTRY}/ezclip-${svc}:${ENVIRONMENT}-${SHORT_SHA}"
+            docker build -t "$image" -f "services/${svc}/Dockerfile" .
+            docker push "$image"
+            digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image")
+            printf '%s=%s\n' "$svc" "$digest" >> image-digests.txt
+          done
+          python3 - <<'PY'
+import json, os
+with open('image-digests.txt') as fh:
+    data = dict(line.strip().split('=', 1) for line in fh if line.strip())
+with open(os.environ['GITHUB_OUTPUT'], 'a') as fo:
+    fo.write('digests=' + json.dumps(data) + '\n')
+PY
+
+      - name: Terraform apply (Cloud Run + infrastructure)
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ env.REGION }}
+          ENVIRONMENT: ${{ steps.context.outputs.environment }}
+          REDIS_TIER: ${{ steps.context.outputs.redis_tier }}
+          REDIS_SIZE: ${{ steps.context.outputs.redis_size }}
+          DIGESTS: ${{ steps.build.outputs.digests }}
+          YT_SECRET: ${{ steps.context.outputs.environment == 'prod' && secrets.YT_HUB_SECRET_PROD || secrets.YT_HUB_SECRET_TEST }}
+          DATABASE_URL: ${{ steps.context.outputs.environment == 'prod' && secrets.DATABASE_URL_PROD || secrets.DATABASE_URL_TEST }}
+        run: |
+          set -euo pipefail
+          cd infra/gcp-terraform
+          terraform init -upgrade
+          terraform workspace select ${ENVIRONMENT} || terraform workspace new ${ENVIRONMENT}
+          WEBHOOK=$(echo "$DIGESTS" | jq -r '.webhook')
+          INGEST=$(echo "$DIGESTS" | jq -r '.ingest')
+          ANALYZE=$(echo "$DIGESTS" | jq -r '.analyze')
+          CLIPPER=$(echo "$DIGESTS" | jq -r '.clipper')
+          PUBLISH=$(echo "$DIGESTS" | jq -r '.publish')
+          terraform apply -auto-approve \
+            -var project_id=${PROJECT_ID} \
+            -var region=${REGION} \
+            -var environment=${ENVIRONMENT} \
+            -var redis_tier=${REDIS_TIER} \
+            -var redis_size_gb=${REDIS_SIZE} \
+            -var webhook_image=${WEBHOOK} \
+            -var ingest_image=${INGEST} \
+            -var analyze_image=${ANALYZE} \
+            -var clipper_image=${CLIPPER} \
+            -var publish_image=${PUBLISH} \
+            -var yt_hub_secret="$YT_SECRET" \
+            -var database_url="$DATABASE_URL"

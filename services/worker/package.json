@@ -1,0 +1,22 @@
+{
+    "name": "@ezclip/worker",
+    "version": "0.1.0",
+    "type": "module",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "scripts": {
+        "build": "tsc -p tsconfig.json",
+        "start": "node dist/index.js",
+        "dev": "ts-node src/index.js"
+    },
+    "dependencies": {
+        "@ezclip/common": "^0.1.0",
+        "bullmq": "^4.15.0",
+        "fs-extra": "^11.2.0"
+    },
+    "devDependencies": {
+        "@types/node": "^20.11.30",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.4.4"
+    }
+}
