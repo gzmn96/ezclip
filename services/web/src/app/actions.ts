@@ -20,8 +20,10 @@ export async function savePlatformPreferences(platforms: string[]) {
     // Actually, let's just insert new ones. 
     // We need to import 'eq' from drizzle-orm to delete.
 
+    const userId = session.user.id;
+
     const values = platforms.map(platform => ({
-        userId: session.user.id!,
+        userId: userId,
         platform,
         // Default settings
         tone: platform === 'linkedin' ? 'professional' : 'casual',
