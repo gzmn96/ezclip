@@ -14,15 +14,14 @@ import {
     createQueue,
     createWorker,
     loadConfig,
-    planChunks,
     serializeScenes,
-    ChunkPlan,
 } from '@ezclip/common';
 
 import { GcsService } from './services/GcsService.js';
 import { GeminiService } from './services/GeminiService.js';
 import { VideoIntelligenceService } from './services/VideoIntelligenceService.js';
 import { WhisperService } from './services/WhisperService.js';
+import { GeminiFlashService, InterestRegion } from './services/GeminiFlashService.js';
 
 dotenv.config();
 
@@ -53,6 +52,7 @@ const gcsService = new GcsService(config.gcsBucket || 'mock-bucket');
 const geminiService = mockAi ? null : new GeminiService(process.env.GOOGLE_CLOUD_PROJECT!);
 const videoIntelligenceService = mockAi ? null : new VideoIntelligenceService();
 const whisperService = mockAi ? null : new WhisperService(process.env.OPENAI_API_KEY!);
+const geminiFlashService = mockAi ? null : new GeminiFlashService(process.env.GOOGLE_CLOUD_PROJECT!);
 
 // Queues
 const analyzeQueue = createQueue<AnalyzeJob>(QUEUES.analyze);
@@ -105,52 +105,148 @@ const probeDuration = async (file: string): Promise<number> => {
     });
 };
 
+const mergeRegions = (regions: InterestRegion[], padding: number, maxDuration: number): InterestRegion[] => {
+    if (regions.length === 0) return [];
+
+    // Sort by start time
+    regions.sort((a, b) => a.start - b.start);
+
+    const merged: InterestRegion[] = [];
+    let current = { ...regions[0] };
+
+    // Apply padding
+    current.start = Math.max(0, current.start - padding);
+    current.end = Math.min(maxDuration, current.end + padding);
+
+    for (let i = 1; i < regions.length; i++) {
+        const next = { ...regions[i] };
+        // Apply padding to next
+        next.start = Math.max(0, next.start - padding);
+        next.end = Math.min(maxDuration, next.end + padding);
+
+        if (next.start <= current.end) {
+            // Overlap, merge
+            current.end = Math.max(current.end, next.end);
+            // Combine reasons
+            current.reason = `${current.reason} + ${next.reason}`;
+            current.score = Math.max(current.score, next.score);
+        } else {
+            merged.push(current);
+            current = next;
+        }
+    }
+    merged.push(current);
+    return merged;
+};
+
 const processIngestJob = async (job: IngestJob) => {
     const { videoId } = job;
-    logger.info({ videoId }, 'processing ingest job');
+    logger.info({ videoId }, 'processing ingest job (Audio-First Filtering)');
     const downloadPath = await ensureSampleVideo(videoId);
     const duration = await probeDuration(downloadPath);
-    const chunkPlans = planChunks(duration);
 
+    // 1. Extract Audio
+    const audioPath = path.join(config.tmpDir, `${videoId}-full.mp3`);
+    logger.info('Extracting full audio...');
+    await runFfmpegCommand([
+        '-y', '-i', downloadPath,
+        '-vn', '-acodec', 'libmp3lame',
+        audioPath
+    ]);
+
+    // 2. Transcribe Full Audio
+    let transcriptText = '';
+    if (!mockAi && whisperService) {
+        logger.info('Transcribing full audio...');
+        const transcription = await whisperService.transcribe(audioPath);
+        transcriptText = transcription.text;
+    } else {
+        transcriptText = "Mock transcript: This is a video about viral marketing. It's very funny and interesting.";
+    }
+
+    // 3. Identify High Interest Regions with Gemini Flash
+    let regions: InterestRegion[] = [];
+    if (!mockAi && geminiFlashService) {
+        logger.info('Analyzing transcript with Gemini Flash...');
+        regions = await geminiFlashService.findHighInterestRegions(transcriptText);
+    } else {
+        regions = [{ start: 0, end: 10, reason: "Mock region", score: 90 }];
+    }
+
+    logger.info({ regionsCount: regions.length }, 'Found high interest regions');
+
+    // 4. Merge and Pad Regions
+    const PADDING_SECONDS = 5;
+    const segments = mergeRegions(regions, PADDING_SECONDS, duration);
+    logger.info({ segmentsCount: segments.length }, 'Merged into segments');
+
+    // 5. Cut Segments and Queue Analyze Jobs
     await Promise.all(
-        chunkPlans.map(async (chunk: ChunkPlan) => {
-            const chunkPath = path.join(config.tmpDir, `${videoId}-chunk-${chunk.index}.mp4`);
-            await fs.copyFile(downloadPath, chunkPath);
+        segments.map(async (segment, index) => {
+            const segmentPath = path.join(config.tmpDir, `${videoId}-segment-${index}.mp4`);
+            const segmentDuration = segment.end - segment.start;
+
+            // Cut segment
+            await runFfmpegCommand([
+                '-y',
+                '-ss', segment.start.toString(),
+                '-i', downloadPath,
+                '-t', segmentDuration.toString(),
+                '-c', 'copy', // Fast copy, but might not be frame accurate. Re-encoding is safer for precise cuts but slower.
+                // Using re-encoding for safety as requested "Never cut exactly on timestamp" implies precision needed?
+                // Actually "copy" is fast but keyframe dependent. 
+                // Let's use fast re-encode to ensure we get the exact padding.
+                // '-c:v', 'libx264', '-preset', 'ultrafast', 
+                // Wait, re-encoding the whole thing is slow. 
+                // Let's try stream copy first, but maybe with a bit more buffer if we can.
+                // The prompt says "Safety Padding: CRITICAL... ensure we don't cut a word in half".
+                // 5s padding is huge, so keyframe issues (usually every 2s) shouldn't matter much.
+                // Stream copy is preferred for cost/speed.
+                segmentPath
+            ]);
+
             const analyzeJob: AnalyzeJob = {
                 videoId,
-                chunkPath,
-                chunkIndex: chunk.index,
+                chunkPath: segmentPath,
+                chunkIndex: index, // Using segment index as chunk index
             };
+
+            // We can pass the pre-calculated reason/score context if we want, 
+            // but AnalyzeJob interface might not support it yet. 
+            // For now, we stick to the interface.
+
             await analyzeQueue.add('chunk', analyzeJob, {
-                jobId: `${videoId}:${chunk.index}`,
+                jobId: `${videoId}:segment:${index}`,
             });
-            logger.info({ videoId, chunkIndex: chunk.index }, 'enqueued analyze job');
+            logger.info({ videoId, segmentIndex: index, start: segment.start, end: segment.end }, 'enqueued analyze job for segment');
         }),
     );
 
-    return { downloadPath, chunkPlans };
+    return { downloadPath, segments };
 };
 
 // --- Analyze Logic ---
 const processAnalyzeJob = async (job: AnalyzeJob) => {
     const { videoId, chunkPath, chunkIndex } = job;
-    logger.info({ videoId, chunkIndex }, 'processing analyze job (Supreme Brain)');
+    logger.info({ videoId, chunkIndex }, 'processing analyze job (Supreme Brain - Segment Analysis)');
 
-    let gcsUri = `gs://${config.gcsBucket || 'mock-bucket'}/videos/${videoId}/chunks/${chunkIndex}.mp4`;
+    let gcsUri = `gs://${config.gcsBucket || 'mock-bucket'}/videos/${videoId}/segments/${chunkIndex}.mp4`;
 
     // 1. Upload to GCS (Skip if mock)
     if (!mockAi) {
-        const destination = `videos/${videoId}/chunks/${chunkIndex}.mp4`;
+        const destination = `videos/${videoId}/segments/${chunkIndex}.mp4`;
         gcsUri = await gcsService.uploadFile(chunkPath, destination);
-        logger.info({ gcsUri }, 'Uploaded chunk to GCS');
+        logger.info({ gcsUri }, 'Uploaded segment to GCS');
     } else {
         logger.info('Skipping GCS upload in mock mode');
     }
 
-    // 2. Analyze with Gemini 1.5 Pro
+    // 2. Analyze with Gemini 1.5 Pro (Visual Analysis)
     let viralMoments;
     if (!mockAi && geminiService) {
         try {
+            // We are analyzing a specific "High Interest" segment now.
+            // We still ask Gemini to find the BEST moments within this segment.
             viralMoments = await geminiService.analyzeVideo(gcsUri);
         } catch (error) {
             logger.error({ error }, 'Gemini analysis failed');
@@ -189,20 +285,16 @@ const processAnalyzeJob = async (job: AnalyzeJob) => {
             reason: moment.explanation,
         };
 
-        const scenesPath = path.join(config.tmpDir, `${videoId}-chunk-${chunkIndex}-scenes.json`);
-        // Appending to file in a real scenario, but here just overwriting for simplicity of the loop
-        // In reality we should aggregate or use DB.
+        const scenesPath = path.join(config.tmpDir, `${videoId}-segment-${chunkIndex}-scenes.json`);
         await fs.writeFile(scenesPath, serializeScenes([scene]));
 
         const clipJob: ClipJob = {
             videoId,
             chunkPath,
             scene,
-            outBase: path.join(config.tmpDir, `${videoId}-chunk-${chunkIndex}`),
+            outBase: path.join(config.tmpDir, `${videoId}-segment-${chunkIndex}`),
         };
 
-        // Pass the GCS URI to the clipper so it can use Video Intelligence
-        // We attach it to the job object (casting as any to avoid changing shared types for now)
         (clipJob as any).gcsUri = gcsUri;
 
         await clipQueue.add('clip', clipJob, { jobId: `${videoId}:${chunkIndex}:${scene.start}` });
