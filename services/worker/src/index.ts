@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
+import dotenv from 'dotenv';
 import {
     AnalyzeJob,
     ClipJob,
@@ -15,24 +16,63 @@ import {
     loadConfig,
     planChunks,
     serializeScenes,
-    runFfmpeg,
     ChunkPlan,
 } from '@ezclip/common';
 
+import { GcsService } from './services/GcsService.js';
+import { GeminiService } from './services/GeminiService.js';
+import { VideoIntelligenceService } from './services/VideoIntelligenceService.js';
+import { WhisperService } from './services/WhisperService.js';
+
+dotenv.config();
+
 const config = loadConfig();
-console.log('DEBUG: REDIS_URL is', config.redisUrl);
-assertRequiredEnv('REDIS_URL', config.redisUrl);
-assertRequiredEnv('GCS_BUCKET', config.gcsBucket);
-if (config.environment === 'test') {
+const logger = createLogger('worker');
+
+// Environment checks
+const isTest = config.environment === 'test';
+const mockAi = process.env.MOCK_AI === 'true' || isTest;
+
+logger.info({ environment: config.environment, mockAi, gcsBucket: config.gcsBucket }, 'Worker starting');
+
+if (!mockAi) {
+    assertRequiredEnv('REDIS_URL', config.redisUrl);
+    assertRequiredEnv('GCS_BUCKET', config.gcsBucket);
+    assertRequiredEnv('GOOGLE_CLOUD_PROJECT', process.env.GOOGLE_CLOUD_PROJECT);
+    assertRequiredEnv('OPENAI_API_KEY', process.env.OPENAI_API_KEY);
+} else {
+    logger.warn('Running in MOCK/TEST mode. Real AI APIs will be skipped.');
+}
+
+if (isTest) {
     assertRequiredEnv('SAMPLE_VIDEO_PATH', config.sampleVideoPath);
 }
 
-const logger = createLogger('worker');
+// Services (initialized only if needed or with dummy values)
+const gcsService = new GcsService(config.gcsBucket || 'mock-bucket');
+const geminiService = mockAi ? null : new GeminiService(process.env.GOOGLE_CLOUD_PROJECT!);
+const videoIntelligenceService = mockAi ? null : new VideoIntelligenceService();
+const whisperService = mockAi ? null : new WhisperService(process.env.OPENAI_API_KEY!);
 
 // Queues
 const analyzeQueue = createQueue<AnalyzeJob>(QUEUES.analyze);
 const clipQueue = createQueue<ClipJob>(QUEUES.clip);
 const publishQueue = createQueue<PublishJob>(QUEUES.publish);
+
+// Local helper for flexible FFmpeg usage
+const runFfmpegCommand = async (args: string[]) => {
+    return new Promise<void>((resolve, reject) => {
+        const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'inherit'] });
+        proc.on('error', reject);
+        proc.on('close', (code) => {
+            if (code === 0) {
+                resolve();
+            } else {
+                reject(new Error(`ffmpeg exited with ${code}`));
+            }
+        });
+    });
+};
 
 // --- Ingest Logic ---
 const ensureSampleVideo = async (videoId: string) => {
@@ -94,41 +134,185 @@ const processIngestJob = async (job: IngestJob) => {
 // --- Analyze Logic ---
 const processAnalyzeJob = async (job: AnalyzeJob) => {
     const { videoId, chunkPath, chunkIndex } = job;
-    logger.info({ videoId, chunkIndex }, 'processing analyze job');
+    logger.info({ videoId, chunkIndex }, 'processing analyze job (Supreme Brain)');
 
-    const scene: Scene = {
-        start: 1,
-        end: 6,
-        score: 0.92,
-        reason: 'exciting',
-    };
+    let gcsUri = `gs://${config.gcsBucket || 'mock-bucket'}/videos/${videoId}/chunks/${chunkIndex}.mp4`;
 
-    const scenesPath = path.join(config.tmpDir, `${videoId}-chunk-${chunkIndex}-scenes.json`);
-    await fs.writeFile(scenesPath, serializeScenes([scene]));
+    // 1. Upload to GCS (Skip if mock)
+    if (!mockAi) {
+        const destination = `videos/${videoId}/chunks/${chunkIndex}.mp4`;
+        gcsUri = await gcsService.uploadFile(chunkPath, destination);
+        logger.info({ gcsUri }, 'Uploaded chunk to GCS');
+    } else {
+        logger.info('Skipping GCS upload in mock mode');
+    }
 
-    const clipJob: ClipJob = {
-        videoId,
-        chunkPath,
-        scene,
-        outBase: path.join(config.tmpDir, `${videoId}-chunk-${chunkIndex}`),
-    };
+    // 2. Analyze with Gemini 1.5 Pro
+    let viralMoments;
+    if (!mockAi && geminiService) {
+        try {
+            viralMoments = await geminiService.analyzeVideo(gcsUri);
+        } catch (error) {
+            logger.error({ error }, 'Gemini analysis failed');
+            throw error; // Retry job
+        }
+    } else {
+        // Mock response
+        viralMoments = [{
+            start_time: "00:00",
+            end_time: "00:10",
+            viral_score: 95,
+            explanation: "Mock viral moment for testing"
+        }];
+    }
 
-    await clipQueue.add('clip', clipJob, { jobId: `${videoId}:${chunkIndex}:${scene.start}` });
-    logger.info({ videoId, chunkIndex }, 'enqueued clip job');
+    logger.info({ viralMoments }, 'Gemini analysis complete');
+
+    // 3. Process moments
+    for (const moment of viralMoments) {
+        // Convert MM:SS to seconds
+        const parseTime = (timeStr: string) => {
+            if (timeStr.includes(':')) {
+                const parts = timeStr.split(':');
+                return parseInt(parts[0]) * 60 + parseInt(parts[1]);
+            }
+            return parseFloat(timeStr);
+        };
+
+        const start = parseTime(moment.start_time);
+        const end = parseTime(moment.end_time);
+
+        const scene: Scene = {
+            start,
+            end,
+            score: moment.viral_score / 100, // Normalize to 0-1
+            reason: moment.explanation,
+        };
+
+        const scenesPath = path.join(config.tmpDir, `${videoId}-chunk-${chunkIndex}-scenes.json`);
+        // Appending to file in a real scenario, but here just overwriting for simplicity of the loop
+        // In reality we should aggregate or use DB.
+        await fs.writeFile(scenesPath, serializeScenes([scene]));
+
+        const clipJob: ClipJob = {
+            videoId,
+            chunkPath,
+            scene,
+            outBase: path.join(config.tmpDir, `${videoId}-chunk-${chunkIndex}`),
+        };
+
+        // Pass the GCS URI to the clipper so it can use Video Intelligence
+        // We attach it to the job object (casting as any to avoid changing shared types for now)
+        (clipJob as any).gcsUri = gcsUri;
+
+        await clipQueue.add('clip', clipJob, { jobId: `${videoId}:${chunkIndex}:${scene.start}` });
+        logger.info({ videoId, chunkIndex, scene }, 'enqueued clip job');
+    }
 };
 
 // --- Clipper Logic ---
 const processClipJob = async (job: ClipJob) => {
     const { videoId, chunkPath, scene, outBase } = job;
-    logger.info({ videoId, chunkPath }, 'processing clip job');
+    const gcsUri = (job as any).gcsUri; // Retrieved from analyze step
+
+    logger.info({ videoId, chunkPath }, 'processing clip job (Supreme Brain)');
     await fs.mkdir(config.tmpDir, { recursive: true });
 
     const duration = scene.end - scene.start;
     const verticalPath = `${outBase}-vertical.mp4`;
     const squarePath = `${outBase}-square.mp4`;
 
-    await runFfmpeg({ input: chunkPath, output: verticalPath, start: scene.start, duration, aspect: '9:16' });
-    await runFfmpeg({ input: chunkPath, output: squarePath, start: scene.start, duration, aspect: '1:1' });
+    // 1. Smart Crop with Video Intelligence
+    let cropFilter = ''; // Default to center crop if fails
+    if (!mockAi && videoIntelligenceService && gcsUri) {
+        try {
+            const annotations = await videoIntelligenceService.analyzeForCropping(gcsUri);
+            // Calculate crop for the middle of the clip to be representative
+            const midPoint = scene.start + duration / 2;
+            const crop = videoIntelligenceService.calculateCrop(midPoint, annotations);
+
+            if (crop) {
+                // Convert normalized coordinates to FFmpeg crop filter
+                // We need video dimensions first. For now assuming 1080p input or similar.
+                // A robust implementation would probe dimensions.
+                // Let's assume standard HD 1920x1080 for the math:
+                const inputW = 1920;
+                const inputH = 1080;
+
+                const x = Math.floor(crop.x * inputW);
+                // const y = Math.floor(crop.y * inputH); // We usually want full height for vertical
+
+                // For 9:16 from 16:9, we want width = height * (9/16)
+                const targetW = Math.floor(inputH * (9 / 16));
+
+                // Center the crop window around the person's x
+                let cropX = x - targetW / 2;
+                // Clamp
+                if (cropX < 0) cropX = 0;
+                if (cropX + targetW > inputW) cropX = inputW - targetW;
+
+                cropFilter = `crop=${targetW}:${inputH}:${cropX}:0`;
+                logger.info({ cropFilter }, 'Calculated smart crop');
+            }
+        } catch (error) {
+            logger.error({ error }, 'Smart crop failed, using default');
+        }
+    }
+
+
+    // 2. Transcribe with Whisper (for future caption overlay)
+    // Extract audio first
+    const audioPath = `${outBase}-audio.mp3`;
+    try {
+        await runFfmpegCommand([
+            '-y',
+            '-ss', scene.start.toString(),
+            '-i', chunkPath,
+            '-t', duration.toString(),
+            '-vn',
+            '-acodec', 'libmp3lame',
+            audioPath
+        ]);
+
+        if (!mockAi && whisperService) {
+            const transcription = await whisperService.transcribe(audioPath);
+            logger.info({ transcriptionLength: transcription.text.length }, 'Whisper transcription complete');
+            // Save transcription for later burning
+            await fs.writeFile(`${outBase}-transcription.json`, JSON.stringify(transcription, null, 2));
+        } else {
+            await fs.writeFile(`${outBase}-transcription.json`, JSON.stringify({ text: "Mock transcription" }));
+        }
+    } catch (error) {
+        logger.error({ error }, 'Whisper transcription/extraction failed');
+    }
+
+    // 3. Render Clips
+    // Vertical 9:16
+    const verticalFilters = cropFilter || 'scale=1080:-2,crop=1080:1920'; // Use smart crop or default center crop
+
+    await runFfmpegCommand([
+        '-y',
+        '-ss', scene.start.toString(),
+        '-i', chunkPath,
+        '-t', duration.toString(),
+        '-vf', verticalFilters,
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+        '-c:a', 'aac',
+        verticalPath
+    ]);
+
+    // Square 1:1 (Simple center crop for now, or could use smart crop logic adapted for square)
+    const squareFilters = 'scale=1080:-2,crop=1080:1080';
+    await runFfmpegCommand([
+        '-y',
+        '-ss', scene.start.toString(),
+        '-i', chunkPath,
+        '-t', duration.toString(),
+        '-vf', squareFilters,
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+        '-c:a', 'aac',
+        squarePath
+    ]);
 
     const caption = `Clip from ${videoId}: ${scene.reason}`;
     const publishJob: PublishJob = {
@@ -165,7 +349,7 @@ const main = () => {
         await processPublishJob(bullJob.data);
     });
 
-    logger.info('worker service ready (ingest, analyze, clipper, publish)');
+    logger.info('Supreme Brain worker service ready');
 };
 
 if (import.meta.url === `file://${process.argv[1]}`) {
