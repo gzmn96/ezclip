@@ -15,6 +15,7 @@ import {
     createWorker,
     loadConfig,
     serializeScenes,
+    createRedisClient,
 } from '@ezclip/common';
 
 import { GcsService } from './services/GcsService.js';
@@ -53,6 +54,21 @@ const geminiService = mockAi ? null : new GeminiService(process.env.GOOGLE_CLOUD
 const videoIntelligenceService = mockAi ? null : new VideoIntelligenceService();
 const whisperService = mockAi ? null : new WhisperService(process.env.OPENAI_API_KEY!);
 const geminiFlashService = mockAi ? null : new GeminiFlashService(process.env.GOOGLE_CLOUD_PROJECT!);
+
+// Redis Publisher for Progress Updates
+const redisPublisher = createRedisClient();
+
+const publishProgress = async (jobId: string, status: string, progress: number) => {
+    try {
+        const channel = `job-progress:${jobId}`;
+        const payload = JSON.stringify({ status, progress });
+        await redisPublisher.publish(channel, payload);
+        // Also store state so new subscribers can get the latest status immediately (optional but good practice)
+        // await redisPublisher.set(`job-status:${jobId}`, payload, 'EX', 3600); 
+    } catch (error) {
+        logger.error({ error, jobId }, 'Failed to publish progress');
+    }
+};
 
 // Queues
 const analyzeQueue = createQueue<AnalyzeJob>(QUEUES.analyze);
@@ -142,10 +158,13 @@ const mergeRegions = (regions: InterestRegion[], padding: number, maxDuration: n
 const processIngestJob = async (job: IngestJob) => {
     const { videoId } = job;
     logger.info({ videoId }, 'processing ingest job (Audio-First Filtering)');
+    await publishProgress(videoId, 'Starting ingest...', 5);
+
     const downloadPath = await ensureSampleVideo(videoId);
     const duration = await probeDuration(downloadPath);
 
     // 1. Extract Audio
+    await publishProgress(videoId, 'Extracting audio track...', 10);
     const audioPath = path.join(config.tmpDir, `${videoId}-full.mp3`);
     logger.info('Extracting full audio...');
     await runFfmpegCommand([
@@ -155,6 +174,7 @@ const processIngestJob = async (job: IngestJob) => {
     ]);
 
     // 2. Transcribe Full Audio
+    await publishProgress(videoId, 'Transcribing audio with Whisper...', 20);
     let transcriptText = '';
     if (!mockAi && whisperService) {
         logger.info('Transcribing full audio...');
@@ -165,6 +185,7 @@ const processIngestJob = async (job: IngestJob) => {
     }
 
     // 3. Identify High Interest Regions with Gemini Flash
+    await publishProgress(videoId, 'Analyzing content with Gemini Flash...', 40);
     let regions: InterestRegion[] = [];
     if (!mockAi && geminiFlashService) {
         logger.info('Analyzing transcript with Gemini Flash...');
@@ -176,11 +197,13 @@ const processIngestJob = async (job: IngestJob) => {
     logger.info({ regionsCount: regions.length }, 'Found high interest regions');
 
     // 4. Merge and Pad Regions
+    await publishProgress(videoId, 'Optimizing segments...', 50);
     const PADDING_SECONDS = 5;
     const segments = mergeRegions(regions, PADDING_SECONDS, duration);
     logger.info({ segmentsCount: segments.length }, 'Merged into segments');
 
     // 5. Cut Segments and Queue Analyze Jobs
+    await publishProgress(videoId, `Cutting ${segments.length} high-interest segments...`, 60);
     await Promise.all(
         segments.map(async (segment, index) => {
             const segmentPath = path.join(config.tmpDir, `${videoId}-segment-${index}.mp4`);
@@ -192,16 +215,7 @@ const processIngestJob = async (job: IngestJob) => {
                 '-ss', segment.start.toString(),
                 '-i', downloadPath,
                 '-t', segmentDuration.toString(),
-                '-c', 'copy', // Fast copy, but might not be frame accurate. Re-encoding is safer for precise cuts but slower.
-                // Using re-encoding for safety as requested "Never cut exactly on timestamp" implies precision needed?
-                // Actually "copy" is fast but keyframe dependent. 
-                // Let's use fast re-encode to ensure we get the exact padding.
-                // '-c:v', 'libx264', '-preset', 'ultrafast', 
-                // Wait, re-encoding the whole thing is slow. 
-                // Let's try stream copy first, but maybe with a bit more buffer if we can.
-                // The prompt says "Safety Padding: CRITICAL... ensure we don't cut a word in half".
-                // 5s padding is huge, so keyframe issues (usually every 2s) shouldn't matter much.
-                // Stream copy is preferred for cost/speed.
+                '-c', 'copy',
                 segmentPath
             ]);
 
@@ -211,10 +225,6 @@ const processIngestJob = async (job: IngestJob) => {
                 chunkIndex: index, // Using segment index as chunk index
             };
 
-            // We can pass the pre-calculated reason/score context if we want, 
-            // but AnalyzeJob interface might not support it yet. 
-            // For now, we stick to the interface.
-
             await analyzeQueue.add('chunk', analyzeJob, {
                 jobId: `${videoId}:segment:${index}`,
             });
@@ -222,6 +232,7 @@ const processIngestJob = async (job: IngestJob) => {
         }),
     );
 
+    await publishProgress(videoId, 'Segments queued for visual analysis', 70);
     return { downloadPath, segments };
 };
 
@@ -229,6 +240,9 @@ const processIngestJob = async (job: IngestJob) => {
 const processAnalyzeJob = async (job: AnalyzeJob) => {
     const { videoId, chunkPath, chunkIndex } = job;
     logger.info({ videoId, chunkIndex }, 'processing analyze job (Supreme Brain - Segment Analysis)');
+    // Note: We might want to publish progress here too, but it could be noisy if many segments run in parallel.
+    // Maybe just publish "Analyzing segment X..."
+    await publishProgress(videoId, `Analyzing segment ${chunkIndex + 1}...`, 75);
 
     let gcsUri = `gs://${config.gcsBucket || 'mock-bucket'}/videos/${videoId}/segments/${chunkIndex}.mp4`;
 
@@ -308,6 +322,8 @@ const processClipJob = async (job: ClipJob) => {
     const gcsUri = (job as any).gcsUri; // Retrieved from analyze step
 
     logger.info({ videoId, chunkPath }, 'processing clip job (Supreme Brain)');
+    await publishProgress(videoId, 'Smart cropping and rendering...', 90);
+
     await fs.mkdir(config.tmpDir, { recursive: true });
 
     const duration = scene.end - scene.start;
@@ -414,6 +430,7 @@ const processClipJob = async (job: ClipJob) => {
 
     await publishQueue.add('publish', publishJob, { jobId: `${videoId}:${scene.start}:publish` });
     logger.info({ verticalPath, squarePath }, 'rendered clips');
+    await publishProgress(videoId, 'Clip ready!', 100);
 
     return { verticalPath, squarePath };
 };

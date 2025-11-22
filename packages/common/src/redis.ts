@@ -1,4 +1,5 @@
 import { Queue, Worker } from 'bullmq';
+import { Redis } from 'ioredis';
 import { loadConfig } from './config.js';
 
 // Note: bullmq types/exports can vary by version. To avoid build-time
@@ -18,4 +19,8 @@ export const createQueue = <T = unknown>(name: string) => {
 
 export const createWorker = <T = unknown>(name: string, processor: any) => {
   return new Worker<T>(name, processor, { connection, prefix: 'ezclip' });
+};
+
+export const createRedisClient = () => {
+  return new Redis(config.redisUrl);
 };
