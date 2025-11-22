@@ -5,9 +5,9 @@ export const dynamic = 'force-dynamic';
 
 export async function GET(
     request: NextRequest,
-    { params }: { params: { id: string } }
+    { params }: { params: Promise<{ id: string }> }
 ) {
-    const jobId = params.id;
+    const { id: jobId } = await params;
     const encoder = new TextEncoder();
 
     // Create a dedicated Redis client for subscription

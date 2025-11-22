@@ -23,6 +23,7 @@ import { GeminiService } from './services/GeminiService.js';
 import { VideoIntelligenceService } from './services/VideoIntelligenceService.js';
 import { WhisperService } from './services/WhisperService.js';
 import { GeminiFlashService, InterestRegion } from './services/GeminiFlashService.js';
+import { SocialPublishService } from './services/SocialPublishService.js';
 
 dotenv.config();
 
@@ -436,8 +437,28 @@ const processClipJob = async (job: ClipJob) => {
 };
 
 // --- Publish Logic ---
+const socialPublishService = new SocialPublishService();
+
 const processPublishJob = async (job: PublishJob) => {
-    logger.info({ file: job.file, caption: job.caption }, 'Would publish');
+    logger.info({ file: job.file, caption: job.caption }, 'Processing publish job');
+
+    // In a real scenario, we would get the userId from the job data.
+    // For now, we'll use a placeholder or extract it if available.
+    const userId = "user_placeholder";
+
+    try {
+        // Auto-publish to YouTube Shorts as part of the "Auto-Pilot"
+        await socialPublishService.publish(userId, job.file, 'youtube', {
+            title: job.caption.substring(0, 100),
+            description: job.caption + "\n\n#Shorts #Ezclip",
+            privacyStatus: 'private' // Safety first
+        });
+
+        await publishProgress((job as any).jobId || 'unknown', 'Published to YouTube!', 100);
+    } catch (error) {
+        logger.error({ error }, 'Failed to publish');
+        // Don't fail the whole job, just log it.
+    }
 };
 
 // --- Main ---
