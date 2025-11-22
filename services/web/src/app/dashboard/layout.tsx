@@ -11,7 +11,6 @@ import {
     Settings,
     CreditCard,
     LogOut,
-    User,
     Menu,
     X
 } from 'lucide-react';

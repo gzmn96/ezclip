@@ -1,14 +1,62 @@
-import { pgTable, uuid, text, timestamp, integer, boolean, numeric, jsonb, uniqueIndex } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, timestamp, integer, boolean, numeric, jsonb, uniqueIndex, primaryKey } from 'drizzle-orm/pg-core';
 
 // --- USERS & AUTH ---
 export const users = pgTable('users', {
     id: uuid('id').primaryKey().defaultRandom(),
-    email: text('email').notNull().unique(),
-    passwordHash: text('password_hash'),
     name: text('name'),
+    email: text('email').notNull().unique(),
+    emailVerified: timestamp("emailVerified", { mode: "date" }),
+    image: text("image"),
+    passwordHash: text('password_hash'),
     createdAt: timestamp('created_at').defaultNow(),
     lastLogin: timestamp('last_login'),
 });
+
+export const accounts = pgTable(
+    "account",
+    {
+        userId: uuid("userId")
+            .notNull()
+            .references(() => users.id, { onDelete: "cascade" }),
+        type: text("type").notNull(),
+        provider: text("provider").notNull(),
+        providerAccountId: text("providerAccountId").notNull(),
+        refresh_token: text("refresh_token"),
+        access_token: text("access_token"),
+        expires_at: integer("expires_at"),
+        token_type: text("token_type"),
+        scope: text("scope"),
+        id_token: text("id_token"),
+        session_state: text("session_state"),
+    },
+    (account) => ({
+        compoundKey: primaryKey({
+            columns: [account.provider, account.providerAccountId],
+        }),
+    })
+)
+
+export const sessions = pgTable("session", {
+    sessionToken: text("sessionToken").primaryKey(),
+    userId: uuid("userId")
+        .notNull()
+        .references(() => users.id, { onDelete: "cascade" }),
+    expires: timestamp("expires", { mode: "date" }).notNull(),
+})
+
+export const verificationTokens = pgTable(
+    "verificationToken",
+    {
+        identifier: text("identifier").notNull(),
+        token: text("token").notNull(),
+        expires: timestamp("expires", { mode: "date" }).notNull(),
+    },
+    (verificationToken) => ({
+        compositePk: primaryKey({
+            columns: [verificationToken.identifier, verificationToken.token],
+        }),
+    })
+);
 
 export const oauthConnections = pgTable('oauth_connections', {
     id: uuid('id').primaryKey().defaultRandom(),
